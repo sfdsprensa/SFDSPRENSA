@@ -34,6 +34,7 @@ function fFecha(iso) { if (!iso) return 'No registrado'; var d = new Date(iso); 
 function fFechaLarga(iso) { if (!iso) return 'No registrado'; var d = new Date(iso); return d.getDate() + ' de ' + MESES[d.getMonth()] + ' de ' + d.getFullYear(); }
 function sameDay(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); }
 function startOfWeek(d) { var x = new Date(d); x.setHours(0,0,0,0); x.setDate(x.getDate() - x.getDay()); return x; }
+function fmtISOdate(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
 
 /* ============================ CONFIGURACIÓN ============================ */
 function loadConfig() {
@@ -56,10 +57,21 @@ function apiUrl(params) {
 function cargarSolicitudes() {
   if (CFG.MODO === 'demo') {
     var d = window.generarDatosDemo();
-    // aplicar estados guardados localmente en demo
+    // aplicar seguimiento guardado localmente en demo
     var st = {};
     try { st = JSON.parse(localStorage.getItem(LS_DEMO_ESTADOS) || '{}'); } catch (e) {}
-    d.forEach(function (s) { if (st[s.id]) { s.estado = st[s.id].estado; s.estadoNota = st[s.id].nota || ''; } });
+    d.forEach(function (s) {
+      if (st[s.id]) {
+        var g = st[s.id];
+        if (g.estado != null) s.estado = g.estado;
+        if (g.delegado != null) s.delegado = g.delegado;
+        if (g.entregado != null) s.entregado = g.entregado;
+        if (g.fechaEntrega != null) s.fechaEntrega = g.fechaEntrega;
+        if (g.publicado != null) s.publicado = g.publicado;
+        if (g.fechaPublicacion != null) s.fechaPublicacion = g.fechaPublicacion;
+        s.estadoNota = g.nota || '';
+      }
+    });
     return Promise.resolve(d);
   }
   if (!CFG.API_URL) return Promise.reject(new Error('No hay URL de API configurada. Ve a Configuración.'));
@@ -71,18 +83,58 @@ function cargarSolicitudes() {
     });
 }
 
-function guardarEstado(id, estado, nota) {
+/* Aplica un cambio al registro en memoria (instantáneo) y devuelve el estado previo para revertir. */
+function snapshotSeg(rec) { return { estado: rec.estado, delegado: rec.delegado, entregado: rec.entregado, fechaEntrega: rec.fechaEntrega, publicado: rec.publicado, fechaPublicacion: rec.fechaPublicacion }; }
+function aplicarPatchLocal(rec, patch) {
+  if (patch.estado != null) rec.estado = patch.estado;
+  if (patch.delegado != null) rec.delegado = patch.delegado;
+  if (patch.entregado != null) {
+    if (patch.entregado && !rec.entregado) { rec.entregado = true; if (!rec.fechaEntrega) rec.fechaEntrega = new Date().toISOString(); }
+    else if (!patch.entregado) { rec.entregado = false; rec.fechaEntrega = ''; }
+  }
+  if (patch.publicado != null) {
+    if (patch.publicado && !rec.publicado) { rec.publicado = true; if (!rec.fechaPublicacion) rec.fechaPublicacion = new Date().toISOString(); }
+    else if (!patch.publicado) { rec.publicado = false; rec.fechaPublicacion = ''; }
+  }
+}
+
+/* Persiste el estado ACTUAL del registro (ya modificado en memoria). No bloquea la interfaz. */
+function persistir(id, patch) {
   var rec = DATA.filter(function (s) { return s.id === id; })[0];
   if (CFG.MODO === 'demo') {
     var st = {}; try { st = JSON.parse(localStorage.getItem(LS_DEMO_ESTADOS) || '{}'); } catch (e) {}
-    st[id] = { estado: estado, nota: nota || '' };
+    st[id] = { estado: rec.estado, delegado: rec.delegado, entregado: rec.entregado, fechaEntrega: rec.fechaEntrega, publicado: rec.publicado, fechaPublicacion: rec.fechaPublicacion, nota: (st[id] && st[id].nota) || '' };
     try { localStorage.setItem(LS_DEMO_ESTADOS, JSON.stringify(st)); } catch (e) {}
-    if (rec) rec.estado = estado;
     return Promise.resolve({ ok: true });
   }
-  return fetch(apiUrl({ action: 'setEstado', id: id, estado: estado, nota: nota || '', usuario: 'dashboard' }), { method: 'GET' })
+  var params = { action: 'actualizar', id: id, usuario: 'dashboard' };
+  if (patch.estado != null) params.estado = patch.estado;
+  if (patch.delegado != null) params.delegado = patch.delegado;
+  if (patch.entregado != null) params.entregado = patch.entregado ? 'true' : 'false';
+  if (patch.publicado != null) params.publicado = patch.publicado ? 'true' : 'false';
+  return fetch(apiUrl(params), { method: 'GET' })
     .then(function (r) { return r.json(); })
-    .then(function (res) { if (!res.ok) throw new Error(res.error || 'No se pudo guardar.'); if (rec) rec.estado = estado; return res; });
+    .then(function (res) { if (!res.ok) throw new Error(res.error || 'No se pudo guardar.'); return res; });
+}
+
+/**
+ * Cambia el seguimiento de forma OPTIMISTA: actualiza la pantalla al instante y guarda
+ * en segundo plano. Si el guardado falla, revierte y avisa.
+ */
+function cambiarSeguimiento(id, patch, okMsg, reabrirDrawer) {
+  var rec = DATA.filter(function (s) { return s.id === id; })[0];
+  if (!rec) return;
+  var prev = snapshotSeg(rec);
+  aplicarPatchLocal(rec, patch);
+  refrescarLigero();
+  if (reabrirDrawer) abrirDrawer(id);
+  if (okMsg) toast(okMsg, 'ok');
+  persistir(id, patch).catch(function (err) {
+    rec.estado = prev.estado; rec.delegado = prev.delegado; rec.entregado = prev.entregado; rec.fechaEntrega = prev.fechaEntrega;
+    rec.publicado = prev.publicado; rec.fechaPublicacion = prev.fechaPublicacion;
+    refrescarLigero(); if (reabrirDrawer) abrirDrawer(id);
+    toast('⚠️ No se guardó: ' + err.message, 'err');
+  });
 }
 
 /* ============================ ESTADO EFECTIVO ============================ */
@@ -94,38 +146,153 @@ function estadoEfectivo(s, now) {
   if (!isNaN(fin.getTime()) && fin.getTime() < now.getTime()) return 'PENDIENTE';
   return 'PROGRAMADA';
 }
-function conEstado(list) { var now = new Date(); return list.map(function (s) { s._estado = estadoEfectivo(s, now); return s; }); }
+function conEstado(list) {
+  var now = new Date();
+  return list.map(function (s) {
+    if (s.delegado == null) s.delegado = '';
+    if (s.entregado == null) s.entregado = false;
+    if (s.fechaEntrega == null) s.fechaEntrega = '';
+    if (s.publicado == null) s.publicado = false;
+    if (s.fechaPublicacion == null) s.fechaPublicacion = '';
+    s._estado = estadoEfectivo(s, now);
+    return s;
+  });
+}
 function esPasada(s) { var fin = new Date(s.finISO || s.inicioISO); return !isNaN(fin) && fin.getTime() < Date.now(); }
+
+/* Tiempo de respuesta: horas entre la fecha de solicitud y la entrega del material a Prensa Central. */
+function tiempoRespuestaHoras(s) {
+  if (!s.entregado || !s.fechaEntrega || !s.fechaCreacion) return null;
+  var diff = new Date(s.fechaEntrega).getTime() - new Date(s.fechaCreacion).getTime();
+  return diff > 0 ? diff / 3600000 : null;
+}
+function fmtDuracion(horas) {
+  if (horas == null) return '—';
+  if (horas < 1) return Math.max(1, Math.round(horas * 60)) + ' min';
+  if (horas < 24) return (horas < 10 ? horas.toFixed(1) : Math.round(horas)) + ' h';
+  var dias = horas / 24;
+  return (dias < 10 ? dias.toFixed(1) : Math.round(dias)) + ' d';
+}
+function promedioRespuesta(list) {
+  var vals = list.map(tiempoRespuestaHoras).filter(function (v) { return v != null; });
+  if (!vals.length) return { prom: null, n: 0 };
+  return { prom: vals.reduce(function (a, b) { return a + b; }, 0) / vals.length, n: vals.length };
+}
+
+/* ============================ TIEMPOS Y PLAZOS ============================ */
+/* Etiqueta principal para agenda/dashboard: el PROGRAMA (para saber de quién es y medir apoyo). */
+function etiquetaPrograma(s) {
+  var p = ndef(s.programa);
+  if (p !== 'No registrado') return p;
+  var n = ndef(s.nombre);
+  return n !== 'No registrado' ? n : s.tipo;
+}
+
+/* Días hábiles (lun–vie, excluyendo festivos de CFG.FESTIVOS) estrictamente entre dos fechas. */
+function esDiaHabil(d) {
+  var w = d.getDay();
+  if (w === 0 || w === 6) return false;
+  return (CFG.FESTIVOS || []).indexOf(fmtISOdate(d)) === -1;
+}
+function diasHabilesEntre(a, b) {
+  var ini = new Date(a); ini.setHours(0, 0, 0, 0);
+  var fin = new Date(b); fin.setHours(0, 0, 0, 0);
+  if (fin <= ini) return 0;
+  var n = 0, cur = new Date(ini), tope = 0;
+  while (cur < fin && tope < 2000) { cur.setDate(cur.getDate() + 1); if (esDiaHabil(cur)) n++; tope++; }
+  return n;
+}
+/* Anticipación con la que se pidió (días hábiles entre la solicitud y la fecha agendada). */
+function anticipacionHabil(s) {
+  if (!s.fechaCreacion || !s.inicioISO) return null;
+  return diasHabilesEntre(new Date(s.fechaCreacion), new Date(s.inicioISO));
+}
+function esSobreLaHora(s) {
+  var a = anticipacionHabil(s);
+  return a != null && a < (CFG.ANTELACION_MINIMA_HABIL || 5);
+}
+
+/* Fecha límite de entrega a Prensa Central = fecha agendada + plazo del tipo (en días). */
+function plazoEntregaDias(s) {
+  var p = CFG.PLAZOS_ENTREGA || {};
+  return p[s.tipo] != null ? p[s.tipo] : 0;
+}
+function fechaLimiteEntrega(s) {
+  if (!s.inicioISO) return null;
+  var d = new Date(s.inicioISO); d.setDate(d.getDate() + plazoEntregaDias(s)); d.setHours(23, 59, 59, 999);
+  return d;
+}
+/* Estado de la entrega a Prensa Central respecto al plazo. */
+function entregaEstado(s) {
+  var lim = fechaLimiteEntrega(s); if (!lim) return null;
+  if (s.entregado && s.fechaEntrega) {
+    return new Date(s.fechaEntrega) <= lim
+      ? { key: 'A_TIEMPO', label: 'Entregada a tiempo', chip: 'REALIZADA' }
+      : { key: 'TARDE', label: 'Entregada tarde', chip: 'NO_REALIZADA' };
+  }
+  if (s._estado === 'CANCELADA') return null;
+  return Date.now() > lim.getTime()
+    ? { key: 'VENCIDA', label: 'Entrega vencida', chip: 'NO_REALIZADA' }
+    : { key: 'EN_PLAZO', label: 'En plazo de entrega', chip: 'PROGRAMADA' };
+}
+/* Tiempo de publicación: horas entre la entrega a central y la publicación. */
+function tiempoPublicacionHoras(s) {
+  if (!s.publicado || !s.fechaPublicacion || !s.fechaEntrega) return null;
+  var diff = new Date(s.fechaPublicacion).getTime() - new Date(s.fechaEntrega).getTime();
+  return diff > 0 ? diff / 3600000 : null;
+}
+function promedioPublicacion(list) {
+  var vals = list.map(tiempoPublicacionHoras).filter(function (v) { return v != null; });
+  if (!vals.length) return { prom: null, n: 0 };
+  return { prom: vals.reduce(function (a, b) { return a + b; }, 0) / vals.length, n: vals.length };
+}
 
 /* ============================ RENDER: CHIPS ============================ */
 function chipEstado(key) { var e = ESTADOS[key] || ESTADOS.PROGRAMADA; return '<span class="chip chip-' + key + '"><span class="dot"></span>' + e.label + '</span>'; }
 function chipTipo(t) { var conf = TIPOS[t]; var emoji = conf ? conf.emoji : '📌'; return '<span class="tipo-chip ' + tipoClass(t) + '">' + emoji + ' ' + esc(t) + '</span>'; }
 
 /* ============================ KPIs ============================ */
-function calcularKpis() {
+/* Filtro de fechas del dashboard (inicio) */
+var dashDesde = '', dashHasta = '';
+function datosDashboard() {
+  return conEstado(DATA).filter(function (s) {
+    var f = new Date(s.inicioISO);
+    if (dashDesde && f < new Date(dashDesde + 'T00:00:00')) return false;
+    if (dashHasta && f > new Date(dashHasta + 'T23:59:59')) return false;
+    return true;
+  });
+}
+
+function calcularKpis(list) {
   var now = new Date();
   var hoy = new Date(now); hoy.setHours(0,0,0,0);
   var finHoy = new Date(hoy); finHoy.setDate(finHoy.getDate() + 1);
   var iniSem = startOfWeek(now); var finSem = new Date(iniSem); finSem.setDate(finSem.getDate() + 7);
   var iniMes = new Date(now.getFullYear(), now.getMonth(), 1); var finMes = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  var d = conEstado(DATA);
+  var full = conEstado(DATA);          // "hoy/semana/mes" son ventanas fijas: siempre sobre todo el conjunto
+  var d = list || full;                 // el resto respeta el rango seleccionado
   function enRango(s, a, b) { var f = new Date(s.inicioISO); return f >= a && f < b; }
-  var count = function (fn) { return d.filter(fn).length; };
+  var count = function (arr, fn) { return arr.filter(fn).length; };
   return {
     total: d.length,
-    hoy: count(function (s) { return enRango(s, hoy, finHoy); }),
-    semana: count(function (s) { return enRango(s, iniSem, finSem); }),
-    mes: count(function (s) { return enRango(s, iniMes, finMes); }),
-    programada: count(function (s) { return s._estado === 'PROGRAMADA'; }),
-    pendiente: count(function (s) { return s._estado === 'PENDIENTE'; }),
-    realizada: count(function (s) { return s._estado === 'REALIZADA'; }),
-    noRealizada: count(function (s) { return s._estado === 'NO_REALIZADA'; }),
-    cancelada: count(function (s) { return s._estado === 'CANCELADA'; })
+    hoy: count(full, function (s) { return enRango(s, hoy, finHoy); }),
+    semana: count(full, function (s) { return enRango(s, iniSem, finSem); }),
+    mes: count(full, function (s) { return enRango(s, iniMes, finMes); }),
+    programada: count(d, function (s) { return s._estado === 'PROGRAMADA'; }),
+    pendiente: count(d, function (s) { return s._estado === 'PENDIENTE'; }),
+    realizada: count(d, function (s) { return s._estado === 'REALIZADA'; }),
+    noRealizada: count(d, function (s) { return s._estado === 'NO_REALIZADA'; }),
+    cancelada: count(d, function (s) { return s._estado === 'CANCELADA'; }),
+    entregado: count(d, function (s) { return s.entregado; }),
+    publicado: count(d, function (s) { return s.publicado; }),
+    pendientePublicar: count(d, function (s) { return s.entregado && !s.publicado; }),
+    sobreLaHora: count(d, function (s) { return esSobreLaHora(s); }),
+    respuesta: promedioRespuesta(d)
   };
 }
 
-function cumplimiento() {
-  var d = conEstado(DATA);
+function cumplimiento(list) {
+  var d = list || conEstado(DATA);
   var pasadas = d.filter(function (s) { return esPasada(s) && s._estado !== 'CANCELADA'; });
   var real = pasadas.filter(function (s) { return s._estado === 'REALIZADA'; }).length;
   var pct = pasadas.length ? Math.round(real / pasadas.length * 100) : 0;
@@ -133,7 +300,9 @@ function cumplimiento() {
 }
 
 function renderDashboard() {
-  var k = calcularKpis();
+  var dd = datosDashboard();
+  var k = calcularKpis(dd);
+  var resp = k.respuesta.prom != null ? fmtDuracion(k.respuesta.prom) : '—';
   var cards = [
     ['Total de solicitudes', k.total, '', ''],
     ['Solicitudes de hoy', k.hoy, '', ''],
@@ -143,18 +312,26 @@ function renderDashboard() {
     ['Pendientes de verificación', k.pendiente, 'st-pend', '🔵'],
     ['Realizadas', k.realizada, 'st-real', '🟢'],
     ['No realizadas', k.noRealizada, 'st-nore', '🔴'],
-    ['Canceladas', k.cancelada, 'st-canc', '⚪']
+    ['Canceladas', k.cancelada, 'st-canc', '⚪'],
+    ['Entregado a central', k.entregado, 'st-real', '📦'],
+    ['Pendiente de publicar', k.pendientePublicar, 'st-pend', '📤'],
+    ['Publicado', k.publicado, 'st-real', '📣'],
+    ['Sobre la hora', k.sobreLaHora, 'st-nore', '⚠️'],
+    ['Tiempo de respuesta prom.', resp, '', '⏱️', k.respuesta.n + ' entregas medidas']
   ];
   var g = el('div', 'kpi-grid');
   cards.forEach(function (c) {
     var e = el('div', 'kpi ' + (c[2] || ''));
-    e.innerHTML = '<div class="k-label">' + (c[3] ? c[3] + ' ' : '') + c[0] + '</div><div class="k-value">' + c[1] + '</div>';
+    e.innerHTML = '<div class="k-label">' + (c[3] ? c[3] + ' ' : '') + c[0] + '</div><div class="k-value">' + c[1] + '</div>' + (c[4] ? '<div class="k-foot">' + c[4] + '</div>' : '');
     g.appendChild(e);
   });
   var host = $('#dashKpis'); host.innerHTML = ''; host.appendChild(g);
 
-  // Cumplimiento
-  var cm = cumplimiento();
+  // Etiqueta de rango activo
+  $('#dashRangoLbl').textContent = (dashDesde || dashHasta) ? ('Periodo: ' + (dashDesde ? fFecha(dashDesde + 'T00:00:00') : '…') + ' – ' + (dashHasta ? fFecha(dashHasta + 'T00:00:00') : '…')) : '';
+
+  // Cumplimiento (sobre el rango)
+  var cm = cumplimiento(dd);
   var u = CFG.CUMPLIMIENTO_UMBRALES;
   var nivel = cm.pct >= u.alto ? { c: 'var(--st-real)', t: '🟢 Alto cumplimiento', bg: '#DEF3EA', col: '#0F7A50' }
     : cm.pct >= u.medio ? { c: 'var(--st-prog)', t: '🟡 Cumplimiento medio', bg: '#FCF1DE', col: '#9A6714' }
@@ -167,7 +344,7 @@ function renderDashboard() {
       '<span class="cumpl-badge" style="background:' + nivel.bg + ';color:' + nivel.col + '">' + nivel.t + '</span></div>' +
     '</div>';
 
-  // Pendientes (resumen en dashboard)
+  // Pendientes (resumen en dashboard) — siempre sobre todo el conjunto
   var pend = conEstado(DATA).filter(function (s) { return s._estado === 'PENDIENTE'; })
     .sort(function (a, b) { return new Date(a.inicioISO) - new Date(b.inicioISO); });
   $('#pendCountTitle').textContent = pend.length;
@@ -177,12 +354,18 @@ function renderDashboard() {
   renderHoy();
   renderUpcomingMini();
 
-  // Gráficos dashboard
-  chartTipo('chTipoDash');
-  chartEstado('chEstadoDash');
+  // Gráficos dashboard (respetan el rango)
+  chartTipo('chTipoDash', dd);
+  chartEstado('chEstadoDash', dd);
 }
 
 /* ============================ PENDIENTES ============================ */
+function opcionesDelegado(sel) {
+  var opts = '<option value="">— Delegar a —</option>';
+  (window.DELEGADOS || []).forEach(function (nom) { opts += '<option value="' + nom + '"' + (sel === nom ? ' selected' : '') + '>' + nom + '</option>'; });
+  return opts;
+}
+
 function renderPendingList(host, items, compact) {
   host.innerHTML = '';
   if (!items.length) { host.innerHTML = '<div class="empty"><span class="big">✅</span>No hay solicitudes pendientes de verificación.</div>'; return; }
@@ -190,20 +373,30 @@ function renderPendingList(host, items, compact) {
     var e = el('div', 'pending-item');
     e.innerHTML =
       '<div class="pi-main">' +
-        '<div class="pi-title">' + chipTipo(s.tipo) + ' ' + esc(ndef(s.nombre)) + '</div>' +
+        '<div class="pi-title">' + chipTipo(s.tipo) + ' 🏷️ ' + esc(etiquetaPrograma(s)) + '</div>' +
         '<div class="pi-meta">' +
           '<span>📅 ' + fFecha(s.inicioISO) + ' · ' + esc(s.horaInicio || '') + '</span>' +
-          '<span>🏷️ ' + esc(ndef(s.programa)) + '</span>' +
+          (ndef(s.nombre) !== 'No registrado' ? '<span>👤 ' + esc(s.nombre) + '</span>' : '') +
           (s.tipo === 'Cubrimiento' ? '<span>📍 ' + esc(ndef(s.lugar)) + '</span>' : '') +
+          (esSobreLaHora(s) ? '<span style="color:#B4292D;font-weight:600">⚠️ Sobre la hora</span>' : '') +
         '</div>' +
       '</div>' +
       '<div class="pi-actions">' +
+        '<select class="deleg-select' + (s.delegado ? ' set' : '') + '">' + opcionesDelegado(s.delegado) + '</select>' +
+        '<label class="entrega-check' + (s.entregado ? ' on' : '') + '"><input type="checkbox"' + (s.entregado ? ' checked' : '') + '> 📦 Entregado a central</label>' +
         '<button class="qbtn ok" data-act="REALIZADA">✓ Realizada</button>' +
         '<button class="qbtn no" data-act="NO_REALIZADA">✕ No realizada</button>' +
         '<button class="qbtn cancel" data-act="CANCELADA">Cancelar</button>' +
       '</div>';
     e.querySelectorAll('.qbtn').forEach(function (b) {
       b.addEventListener('click', function () { accionEstado(s.id, b.getAttribute('data-act')); });
+    });
+    e.querySelector('.deleg-select').addEventListener('change', function () {
+      cambiarSeguimiento(s.id, { delegado: this.value }, this.value ? ('👤 Delegado a ' + this.value + '.') : 'Delegación quitada.');
+    });
+    e.querySelector('.entrega-check input').addEventListener('change', function () {
+      var chk = this.checked;
+      cambiarSeguimiento(s.id, { entregado: chk }, chk ? '📦 Material marcado como entregado.' : 'Entrega desmarcada.');
     });
     e.querySelector('.pi-main').addEventListener('click', function () { abrirDrawer(s.id); });
     e.querySelector('.pi-main').style.cursor = 'pointer';
@@ -219,10 +412,7 @@ function renderPendientesFull() {
 }
 
 function accionEstado(id, estado) {
-  guardarEstado(id, estado).then(function () {
-    toast(ESTADOS[estado].emoji + ' Solicitud marcada como ' + ESTADOS[estado].label.toLowerCase() + '.', 'ok');
-    refrescarVistas();
-  }).catch(function (err) { toast('Error: ' + err.message, 'err'); });
+  cambiarSeguimiento(id, { estado: estado }, ESTADOS[estado].emoji + ' Solicitud marcada como ' + ESTADOS[estado].label.toLowerCase() + '.');
 }
 
 /* ============================ AGENDA DE HOY / PRÓXIMAS ============================ */
@@ -242,9 +432,10 @@ function renderHoy() {
     wrap.innerHTML = '<div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px">' + chipTipo(t) + '</div>';
     grupos[t].forEach(function (s) {
       var r = el('div');
-      r.style.cssText = 'display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #F0F3F5;cursor:pointer;font-size:13px';
+      r.style.cssText = 'display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #F0F3F5;cursor:pointer;font-size:13px;align-items:center';
+      var sec = [ndef(s.nombre) !== 'No registrado' ? s.nombre : null, ndef(s.telefono) !== 'No registrado' ? s.telefono : null].filter(Boolean).join(' · ');
       r.innerHTML = '<span style="font-family:var(--font-num);color:var(--petrol);flex:0 0 46px">' + esc(s.horaInicio || '--:--') + '</span>' +
-        '<span style="flex:1">' + esc(ndef(s.nombre)) + ' <span style="color:var(--faint)">· ' + esc(ndef(s.telefono)) + '</span></span>' + chipEstado(s._estado);
+        '<span style="flex:1"><strong>🏷️ ' + esc(etiquetaPrograma(s)) + '</strong>' + (sec ? ' <span style="color:var(--faint)">· ' + esc(sec) + '</span>' : '') + '</span>' + chipEstado(s._estado);
       r.addEventListener('click', function () { abrirDrawer(s.id); });
       wrap.appendChild(r);
     });
@@ -263,7 +454,7 @@ function renderUpcomingMini() {
     var r = el('div');
     r.style.cssText = 'display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #F0F3F5;cursor:pointer;font-size:13px';
     r.innerHTML = '<span style="font-family:var(--font-num);color:var(--petrol);flex:0 0 86px">' + fFecha(s.inicioISO) + '</span>' +
-      chipTipo(s.tipo) + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(ndef(s.nombre)) + '</span>' +
+      chipTipo(s.tipo) + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><strong>' + esc(etiquetaPrograma(s)) + '</strong></span>' +
       '<span style="font-family:var(--font-num);color:var(--muted)">' + esc(s.horaInicio || '') + '</span>';
     r.addEventListener('click', function () { abrirDrawer(s.id); });
     host.appendChild(r);
@@ -308,7 +499,8 @@ function vistaMes(d) {
 function evChip(s) {
   var e = el('div', 'ev' + (s._estado === 'REALIZADA' || s._estado === 'CANCELADA' ? ' done' : ''));
   e.style.background = evColor(s);
-  e.innerHTML = '<span class="evtime">' + esc(s.horaInicio || '') + '</span><span class="txt">' + esc(ndef(s.nombre)) + '</span>';
+  e.title = etiquetaPrograma(s) + ' · ' + s.tipo + (ndef(s.nombre) !== 'No registrado' ? ' · ' + s.nombre : '');
+  e.innerHTML = '<span class="evtime">' + esc(s.horaInicio || '') + '</span><span class="txt">' + esc(etiquetaPrograma(s)) + '</span>';
   e.addEventListener('click', function () { abrirDrawer(s.id); });
   return e;
 }
@@ -343,7 +535,7 @@ function renderDia(host, d) {
     row.innerHTML = '<div class="dr-time">' + esc(s.horaInicio || '--:--') + '</div><div class="dr-events"></div>';
     var box = el('div');
     box.style.cssText = 'display:flex;align-items:center;gap:10px;cursor:pointer;padding:4px 0';
-    box.innerHTML = chipTipo(s.tipo) + '<strong style="flex:1">' + esc(ndef(s.nombre)) + '</strong>' + chipEstado(s._estado);
+    box.innerHTML = chipTipo(s.tipo) + '<strong style="flex:1">🏷️ ' + esc(etiquetaPrograma(s)) + (ndef(s.nombre) !== 'No registrado' ? ' <span style="font-weight:400;color:var(--muted)">· ' + esc(s.nombre) + '</span>' : '') + '</strong>' + chipEstado(s._estado);
     box.addEventListener('click', function () { abrirDrawer(s.id); });
     row.querySelector('.dr-events').appendChild(box);
     list.appendChild(row);
@@ -360,8 +552,8 @@ function renderListaAgenda(host, d) {
     var r = el('div', 'agenda-list-item');
     r.innerHTML = '<span class="ali-date">' + fFecha(s.inicioISO) + '</span>' +
       '<span style="font-family:var(--font-num);color:var(--muted);flex:0 0 44px">' + esc(s.horaInicio || '') + '</span>' +
-      chipTipo(s.tipo) + '<strong style="flex:1">' + esc(ndef(s.nombre)) + '</strong>' +
-      '<span style="color:var(--muted);font-size:12px">' + esc(ndef(s.programa)) + '</span>' + chipEstado(s._estado);
+      chipTipo(s.tipo) + '<strong style="flex:1">🏷️ ' + esc(etiquetaPrograma(s)) + '</strong>' +
+      '<span style="color:var(--muted);font-size:12px">' + (ndef(s.nombre) !== 'No registrado' ? esc(s.nombre) : '') + '</span>' + chipEstado(s._estado);
     r.addEventListener('click', function () { abrirDrawer(s.id); });
     body.appendChild(r);
   });
@@ -402,18 +594,22 @@ function renderTabla() {
     return (va < vb ? -1 : va > vb ? 1 : 0) * sortDir;
   });
   var body = $('#mainTableBody'); body.innerHTML = '';
-  if (!rows.length) { body.innerHTML = '<tr><td colspan="8"><div class="empty">Sin resultados con los filtros actuales.</div></td></tr>'; }
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="10"><div class="empty">Sin resultados con los filtros actuales.</div></td></tr>'; }
   rows.forEach(function (s) {
     var lugarDesc = s.tipo === 'Pieza gráfica' ? esc(ndef(s.descripcionPieza)) : esc(ndef(s.lugar));
+    var deleg = s.delegado ? '<span class="deleg-tag ' + s.delegado + '">👤 ' + esc(s.delegado) + '</span>' : '<span style="color:var(--faint)">—</span>';
+    var entreg = s.entregado ? '<span class="entregado-badge">📦 Sí</span>' : '<span style="color:var(--faint)">No</span>';
     var tr = el('tr', 'row-click');
     tr.innerHTML =
-      '<td class="num">' + fFecha(s.inicioISO) + '</td>' +
+      '<td class="num">' + fFecha(s.inicioISO) + (esSobreLaHora(s) ? '<span class="sobrehora-tag" title="Solicitada con poca anticipación">⚠️</span>' : '') + '</td>' +
       '<td class="num">' + esc(s.horaInicio || '—') + '</td>' +
       '<td>' + esc(ndef(s.nombre)) + '</td>' +
       '<td>' + esc(ndef(s.programa)) + '</td>' +
       '<td style="font-size:12px;color:var(--muted)">' + esc(ndef(s.telefono)) + '<br>' + esc(ndef(s.correo)) + '</td>' +
       '<td>' + chipTipo(s.tipo) + '</td>' +
       '<td class="desc-cell">' + lugarDesc + '</td>' +
+      '<td>' + deleg + '</td>' +
+      '<td>' + entreg + '</td>' +
       '<td>' + chipEstado(s._estado) + '</td>';
     tr.addEventListener('click', function () { abrirDrawer(s.id); });
     body.appendChild(tr);
@@ -461,18 +657,96 @@ function renderVideos() {
   });
 }
 
+/* ============================ PRENSA CENTRAL (DESPACHO) ============================ */
+function despachoItem(s, opciones) {
+  var est = entregaEstado(s);
+  var e = el('div', 'pending-item');
+  if (opciones.borde) e.style.borderLeftColor = opciones.borde;
+  var meta = [
+    '<span>📅 ' + fFecha(s.inicioISO) + '</span>',
+    (s.delegado ? '<span>👤 ' + esc(s.delegado) + '</span>' : ''),
+    (s.entregado && s.fechaEntrega ? '<span>📦 Entregó: ' + fFecha(s.fechaEntrega) + '</span>' : ''),
+    (est ? '<span class="chip chip-' + est.chip + '" style="padding:1px 7px"><span class="dot"></span>' + est.label + '</span>' : ''),
+    (s.publicado && s.fechaPublicacion ? '<span>📣 Publicó: ' + fFecha(s.fechaPublicacion) + '</span>' : '')
+  ].filter(Boolean).join('');
+  e.innerHTML =
+    '<div class="pi-main">' +
+      '<div class="pi-title">' + chipTipo(s.tipo) + ' 🏷️ ' + esc(etiquetaPrograma(s)) + '</div>' +
+      '<div class="pi-meta">' + meta + '</div>' +
+    '</div>' +
+    '<div class="pi-actions">' + opciones.acciones + '</div>';
+  e.querySelector('.pi-main').style.cursor = 'pointer';
+  e.querySelector('.pi-main').addEventListener('click', function () { abrirDrawer(s.id); });
+  if (opciones.bind) opciones.bind(e, s);
+  return e;
+}
+
+function renderDespacho() {
+  var d = conEstado(DATA);
+  var entregadas = d.filter(function (s) { return s.entregado; });
+  var pendPub = entregadas.filter(function (s) { return !s.publicado; }).sort(function (a, b) { return new Date(a.fechaEntrega) - new Date(b.fechaEntrega); });
+  var publicadas = d.filter(function (s) { return s.publicado; }).sort(function (a, b) { return new Date(b.fechaPublicacion) - new Date(a.fechaPublicacion); });
+  var vencidas = d.filter(function (s) { var e = entregaEstado(s); return !s.entregado && e && e.key === 'VENCIDA'; }).sort(function (a, b) { return new Date(a.inicioISO) - new Date(b.inicioISO); });
+  var pctPub = entregadas.length ? Math.round(publicadas.length / entregadas.length * 100) : 0;
+  var tpub = promedioPublicacion(publicadas);
+
+  $('#despKpis').innerHTML = [
+    miniKpi('📦 Entregado a central', entregadas.length),
+    miniKpi('📤 Pendiente de publicar', pendPub.length),
+    miniKpi('📣 Publicado', publicadas.length),
+    miniKpi('% de publicación', pctPub + '%'),
+    miniKpi('⏱️ Tiempo de publicación', tpub.prom != null ? fmtDuracion(tpub.prom) : '—'),
+    miniKpi('🔴 Entregas vencidas', vencidas.length)
+  ].join('');
+  $('#navDespBadge').textContent = pendPub.length;
+
+  // Pendiente de publicar
+  var host1 = $('#despPendPub'); host1.innerHTML = '';
+  if (!pendPub.length) host1.innerHTML = '<div class="empty"><span class="big">✅</span>No hay material pendiente de publicar.</div>';
+  pendPub.forEach(function (s) {
+    host1.appendChild(despachoItem(s, {
+      borde: 'var(--st-pend)',
+      acciones: '<button class="qbtn ok" data-pub="1">📣 Marcar publicado</button>',
+      bind: function (e, s) { e.querySelector('[data-pub]').addEventListener('click', function () { cambiarSeguimiento(s.id, { publicado: true }, '📣 Publicado registrado.'); }); }
+    }));
+  });
+
+  // Entregas vencidas (el equipo SFDS aún no entrega a central)
+  var host3 = $('#despVencidas'); host3.innerHTML = '';
+  if (!vencidas.length) host3.innerHTML = '<div class="empty"><span class="big">👍</span>Sin entregas vencidas.</div>';
+  vencidas.forEach(function (s) {
+    host3.appendChild(despachoItem(s, {
+      borde: 'var(--st-nore)',
+      acciones: '<label class="entrega-check"><input type="checkbox"> 📦 Entregado a central</label>',
+      bind: function (e, s) { e.querySelector('input').addEventListener('change', function () { cambiarSeguimiento(s.id, { entregado: this.checked }, '📦 Entregado a Prensa Central.'); }); }
+    }));
+  });
+
+  // Publicadas (recientes)
+  var host2 = $('#despPublicadas'); host2.innerHTML = '';
+  if (!publicadas.length) host2.innerHTML = '<div class="empty"><span class="big">📭</span>Aún no hay publicaciones registradas.</div>';
+  publicadas.slice(0, 30).forEach(function (s) {
+    var tp = tiempoPublicacionHoras(s);
+    host2.appendChild(despachoItem(s, {
+      borde: 'var(--st-real)',
+      acciones: (tp != null ? '<span class="deleg-tag">⏱️ ' + fmtDuracion(tp) + '</span>' : '') + '<button class="qbtn cancel" data-unpub="1">Deshacer</button>',
+      bind: function (e, s) { e.querySelector('[data-unpub]').addEventListener('click', function () { cambiarSeguimiento(s.id, { publicado: false }, 'Publicación deshecha.'); }); }
+    }));
+  });
+}
+
 /* ============================ GRÁFICOS ============================ */
 function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
 function baseOpts(extra) { return Object.assign({ responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { font: { family: 'Inter', size: 11 } } } } }, extra || {}); }
 function mkChart(id, cfg) { var c = document.getElementById(id); if (!c) return; destroyChart(id); charts[id] = new Chart(c.getContext('2d'), cfg); }
 
-function chartTipo(id) {
-  var d = conEstado(DATA); var labels = Object.keys(TIPOS);
+function chartTipo(id, list) {
+  var d = list || conEstado(DATA); var labels = Object.keys(TIPOS);
   var vals = labels.map(function (t) { return d.filter(function (s) { return s.tipo === t; }).length; });
   mkChart(id, { type: 'doughnut', data: { labels: labels, datasets: [{ data: vals, backgroundColor: labels.map(function (t) { return TIPOS[t].color; }), borderWidth: 2, borderColor: '#fff' }] }, options: baseOpts({ cutout: '62%', plugins: { legend: { position: 'bottom' } } }) });
 }
-function chartEstado(id) {
-  var d = conEstado(DATA); var keys = ['PROGRAMADA','PENDIENTE','REALIZADA','NO_REALIZADA','CANCELADA'];
+function chartEstado(id, list) {
+  var d = list || conEstado(DATA); var keys = ['PROGRAMADA','PENDIENTE','REALIZADA','NO_REALIZADA','CANCELADA'];
   var vals = keys.map(function (k) { return d.filter(function (s) { return s._estado === k; }).length; });
   mkChart(id, { type: 'doughnut', data: { labels: keys.map(function (k) { return ESTADOS[k].label; }), datasets: [{ data: vals, backgroundColor: keys.map(function (k) { return ESTADOS[k].color; }), borderWidth: 2, borderColor: '#fff' }] }, options: baseOpts({ cutout: '62%', plugins: { legend: { position: 'bottom' } } }) });
 }
@@ -515,7 +789,24 @@ function chartCubEstado(id) {
 
 function renderAnalisis() {
   chartPrograma('chPrograma'); chartTipo('chTipo'); chartMes('chMes'); chartDow('chDow'); chartEstado('chEstado'); chartCumplMes('chCumpl');
-  renderCarga(); renderAlertas(); renderAnalisisPrograma();
+  renderCarga(); renderRespuesta(); renderAlertas(); renderAnalisisPrograma();
+}
+
+function renderRespuesta() {
+  var d = conEstado(DATA);
+  var global = promedioRespuesta(d);
+  var cards = [];
+  cards.push(miniKpi('Promedio general', global.prom != null ? fmtDuracion(global.prom) : '—'));
+  cards.push(miniKpi('Entregas medidas', global.n));
+  Object.keys(TIPOS).forEach(function (t) {
+    var r = promedioRespuesta(d.filter(function (s) { return s.tipo === t; }));
+    cards.push(miniKpi(TIPOS[t].emoji + ' ' + t, r.prom != null ? fmtDuracion(r.prom) : '—'));
+  });
+  (window.DELEGADOS || []).forEach(function (nom) {
+    var r = promedioRespuesta(d.filter(function (s) { return s.delegado === nom; }));
+    cards.push(miniKpi('👤 ' + nom, r.prom != null ? fmtDuracion(r.prom) : '—'));
+  });
+  $('#respCards').innerHTML = cards.join('');
 }
 
 /* ============================ ANÁLISIS POR PROGRAMA ============================ */
@@ -577,8 +868,11 @@ function renderAlertas() {
   d.filter(function (s) { return new Date(s.inicioISO) >= now; }).forEach(function (s) { var k = new Date(s.inicioISO).toDateString(); (mapDia[k] = mapDia[k] || []).push(s); });
   var concentra = Object.keys(mapDia).filter(function (k) { return mapDia[k].length >= 4; }).map(function (k) { return { fecha: new Date(k), n: mapDia[k].length }; }).sort(function (a, b) { return a.fecha - b.fecha; });
 
-  // poca anticipación (creada < 24h antes del servicio)
-  var pocaAntic = d.filter(function (s) { if (!s.fechaCreacion) return false; var diff = new Date(s.inicioISO) - new Date(s.fechaCreacion); return diff > 0 && diff < 24 * 3600000 && new Date(s.inicioISO) >= now; });
+  // sobre la hora (solicitada con menos de la antelación mínima en días hábiles)
+  var sobreHora = d.filter(function (s) { return esSobreLaHora(s); }).sort(function (a, b) { return new Date(b.inicioISO) - new Date(a.inicioISO); });
+
+  // entregas vencidas a Prensa Central (pasó el plazo y aún no se entrega)
+  var entVencidas = d.filter(function (s) { var e = entregaEstado(s); return !s.entregado && e && e.key === 'VENCIDA'; }).sort(function (a, b) { return new Date(a.inicioISO) - new Date(b.inicioISO); });
 
   // información incompleta
   var incompletas = d.filter(function (s) {
@@ -597,8 +891,9 @@ function renderAlertas() {
     listCard('⚠️', 'Próximos 7 días', p7, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(ndef(s.nombre)) + '</li>'; }) +
     listCard('🔵', 'Pendientes de verificación', pend, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(ndef(s.nombre)) + '</li>'; }) +
     listCard('🔴', 'Alta concentración de solicitudes', concentra, function (c) { return '<li><span class="when">' + fFecha(c.fecha.toISOString()) + '</span>' + c.n + ' solicitudes ese día</li>'; }) +
-    listCard('⚠️', 'Solicitudes con poca anticipación', pocaAntic, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(ndef(s.nombre)) + '</li>'; }) +
-    listCard('⚠️', 'Información incompleta', incompletas, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(ndef(s.nombre)) + ' · ' + chipTipo(s.tipo) + '</li>'; });
+    listCard('⚠️', 'Sobre la hora (< ' + (CFG.ANTELACION_MINIMA_HABIL || 5) + ' días hábiles)', sobreHora, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(etiquetaPrograma(s)) + ' · ' + chipTipo(s.tipo) + '</li>'; }) +
+    listCard('🔴', 'Entregas vencidas a Prensa Central', entVencidas, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(etiquetaPrograma(s)) + ' · ' + chipTipo(s.tipo) + '</li>'; }) +
+    listCard('⚠️', 'Información incompleta', incompletas, function (s) { return '<li><span class="when">' + fFecha(s.inicioISO) + '</span>' + esc(etiquetaPrograma(s)) + ' · ' + chipTipo(s.tipo) + '</li>'; });
 }
 
 /* ============================ DRAWER (detalle) ============================ */
@@ -615,16 +910,56 @@ function abrirDrawer(id) {
   if (s.tipo === 'Pieza gráfica') fields.push(['Descripción de la pieza', ndef(s.descripcionPieza)]);
   if (s.tipo === 'Grabación de video') { fields.push(['Lugar', ndef(s.lugar)]); }
   if (s.infoAdicional && s.infoAdicional !== 'No registrado') fields.push(['Información adicional', s.infoAdicional]);
+  fields.push(['Fecha de solicitud', s.fechaCreacion ? fFechaLarga(s.fechaCreacion) : 'No registrado']);
+  // Antelación / sobre la hora
+  var ant = anticipacionHabil(s);
+  if (ant != null) fields.push([(esSobreLaHora(s) ? '⚠️ ' : '') + 'Anticipación de la solicitud', ant + ' día(s) hábil(es)' + (esSobreLaHora(s) ? ' — SOBRE LA HORA (mín. ' + (CFG.ANTELACION_MINIMA_HABIL || 5) + ')' : '')]);
+  // Plazo de entrega a Prensa Central
+  var lim = fechaLimiteEntrega(s); var est = entregaEstado(s);
+  if (lim) fields.push(['Fecha límite de entrega a Prensa Central', fFechaLarga(lim.toISOString()) + (plazoEntregaDias(s) ? ' (' + plazoEntregaDias(s) + ' días después)' : ' (mismo día)')]);
+  if (s.entregado && s.fechaEntrega) {
+    fields.push(['Entregado a Prensa Central', fFechaLarga(s.fechaEntrega) + (est ? ' — ' + est.label : '')]);
+    var tr = tiempoRespuestaHoras(s);
+    if (tr != null) fields.push(['⏱️ Tiempo de respuesta', fmtDuracion(tr) + ' (solicitud → entrega)']);
+  } else if (est) {
+    fields.push(['Estado de entrega', est.label]);
+  }
+  if (s.publicado && s.fechaPublicacion) {
+    fields.push(['📣 Publicado por Prensa Central', fFechaLarga(s.fechaPublicacion)]);
+    var tp = tiempoPublicacionHoras(s);
+    if (tp != null) fields.push(['Tiempo de publicación', fmtDuracion(tp) + ' (entrega → publicación)']);
+  }
   fields.push(['ID del evento', s.id, true]);
   $('#drBody').innerHTML = fields.map(function (f) {
     return '<div class="field"><div class="f-label">' + f[0] + '</div><div class="f-value' + (f[2] ? ' mono' : '') + '">' + esc(f[1]) + '</div></div>';
   }).join('');
 
+  // Seguimiento: delegado + entrega a central + publicación
+  var seg = el('div');
+  seg.style.cssText = 'margin-top:6px;padding-top:14px;border-top:1px solid var(--line)';
+  seg.innerHTML =
+    '<div class="f-label" style="margin-bottom:6px">Delegar actividad a</div>' +
+    '<select class="deleg-select' + (s.delegado ? ' set' : '') + '" id="drDeleg" style="width:100%;margin-bottom:12px;padding:8px">' + opcionesDelegado(s.delegado) + '</select>' +
+    '<label class="entrega-check' + (s.entregado ? ' on' : '') + '" id="drEntregaLbl" style="width:100%;justify-content:center;margin-bottom:8px"><input type="checkbox" id="drEntrega"' + (s.entregado ? ' checked' : '') + '> 📦 Entregado a Prensa Central</label>' +
+    '<label class="entrega-check pub' + (s.publicado ? ' on' : '') + '" id="drPubLbl" style="width:100%;justify-content:center"><input type="checkbox" id="drPub"' + (s.publicado ? ' checked' : '') + '> 📣 Publicado por Prensa Central</label>';
+  $('#drBody').appendChild(seg);
+  $('#drDeleg').addEventListener('change', function () {
+    cambiarSeguimiento(s.id, { delegado: this.value }, '👤 Actividad delegada.', true);
+  });
+  $('#drEntrega').addEventListener('change', function () {
+    var chk = this.checked;
+    cambiarSeguimiento(s.id, { entregado: chk }, chk ? '📦 Entregado a Prensa Central.' : 'Entrega desmarcada.', true);
+  });
+  $('#drPub').addEventListener('change', function () {
+    var chk = this.checked;
+    cambiarSeguimiento(s.id, { publicado: chk }, chk ? '📣 Marcado como publicado.' : 'Publicación desmarcada.', true);
+  });
+
   var picker = $('#drStatusPicker'); picker.innerHTML = '';
   [['REALIZADA','qbtn ok'],['NO_REALIZADA','qbtn no'],['CANCELADA','qbtn cancel'],['PROGRAMADA','qbtn']].forEach(function (o) {
     var b = el('button', o[1], ESTADOS[o[0]].emoji + ' ' + ESTADOS[o[0]].label);
     b.style.justifyContent = 'center';
-    b.addEventListener('click', function () { guardarEstado(s.id, o[0]).then(function () { toast('Estado actualizado a ' + ESTADOS[o[0]].label.toLowerCase() + '.', 'ok'); refrescarVistas(); abrirDrawer(s.id); }).catch(function (e) { toast('Error: ' + e.message, 'err'); }); });
+    b.addEventListener('click', function () { cambiarSeguimiento(s.id, { estado: o[0] }, 'Estado actualizado a ' + ESTADOS[o[0]].label.toLowerCase() + '.', true); });
     picker.appendChild(b);
   });
   var cal = $('#drCalLink'); if (s.enlaceEvento) { cal.href = s.enlaceEvento; cal.style.display = ''; } else { cal.style.display = 'none'; }
@@ -685,11 +1020,25 @@ function renderInforme() {
 /* ============================ EXPORTACIÓN ============================ */
 function tablaExportable(list) {
   return list.map(function (s) {
+    var tr = tiempoRespuestaHoras(s); var tp = tiempoPublicacionHoras(s);
+    var lim = fechaLimiteEntrega(s); var est = entregaEstado(s); var ant = anticipacionHabil(s);
     return {
       Fecha: fFecha(s.inicioISO), Hora: s.horaInicio || '', HoraFin: s.horaFin || '',
       Solicitante: ndef(s.nombre), Correo: ndef(s.correo), Telefono: ndef(s.telefono),
       Programa: ndef(s.programa), Tipo: s.tipo, Lugar: ndef(s.lugar),
       DescripcionPieza: ndef(s.descripcionPieza), Estado: (ESTADOS[s._estado] || {}).label || s._estado,
+      Delegado: s.delegado || 'Sin asignar',
+      FechaSolicitud: s.fechaCreacion ? fFecha(s.fechaCreacion) : '',
+      AnticipacionHabil: ant != null ? ant : '',
+      SobreLaHora: esSobreLaHora(s) ? 'Sí' : 'No',
+      FechaLimiteEntrega: lim ? fFecha(lim.toISOString()) : '',
+      EntregadoACentral: s.entregado ? 'Sí' : 'No',
+      FechaEntrega: s.fechaEntrega ? fFecha(s.fechaEntrega) : '',
+      EstadoEntrega: est ? est.label : '',
+      TiempoRespuesta: tr != null ? fmtDuracion(tr) : '',
+      Publicado: s.publicado ? 'Sí' : 'No',
+      FechaPublicacion: s.fechaPublicacion ? fFecha(s.fechaPublicacion) : '',
+      TiempoPublicacion: tp != null ? fmtDuracion(tp) : '',
       InfoAdicional: ndef(s.infoAdicional), Enlace: s.enlaceEvento || ''
     };
   });
@@ -744,10 +1093,33 @@ function refrescarSelectores() {
 }
 
 /* ============================ REFRESCO GLOBAL ============================ */
+function vistaActual() { var v = document.querySelector('.view.active'); return v ? v.id.replace('view-', '') : 'dashboard'; }
+function renderVistaActual() {
+  var v = vistaActual();
+  if (v === 'dashboard') renderDashboard();
+  else if (v === 'agenda') renderAgenda();
+  else if (v === 'solicitudes') renderTabla();
+  else if (v === 'cubrimientos') renderCubrimientos();
+  else if (v === 'piezas') renderPiezas();
+  else if (v === 'videos') renderVideos();
+  else if (v === 'pendientes') renderPendientesFull();
+  else if (v === 'despacho') renderDespacho();
+  else if (v === 'analisis') renderAnalisis();
+  else if (v === 'informes') renderInforme();
+}
+function actualizarBadges() {
+  var d = conEstado(DATA);
+  $('#navPendBadge').textContent = d.filter(function (s) { return s._estado === 'PENDIENTE'; }).length;
+  $('#navDespBadge').textContent = d.filter(function (s) { return s.entregado && !s.publicado; }).length;
+}
+/* Refresco rápido tras guardar: solo actualiza los badges y la vista visible (no re-dibuja todo). */
+function refrescarLigero() {
+  actualizarBadges();
+  renderVistaActual();
+}
 function refrescarVistas() {
-  var k = calcularKpis();
-  $('#navPendBadge').textContent = k.pendiente;
-  renderDashboard(); renderTabla(); renderPendientesFull();
+  actualizarBadges();
+  renderDashboard(); renderTabla(); renderPendientesFull(); renderDespacho();
   renderCubrimientos(); renderPiezas(); renderVideos();
   renderAgenda(); renderAnalisis(); renderInforme();
 }
@@ -779,6 +1151,7 @@ var TITULOS = {
   solicitudes: ['Solicitudes', 'Tabla general de solicitudes'], cubrimientos: ['Cubrimientos', 'Servicios de cubrimiento'],
   piezas: ['Piezas gráficas', 'Solicitudes de diseño'], videos: ['Videos', 'Grabaciones de video'],
   pendientes: ['Pendientes de verificación', 'Solicitudes por confirmar'], analisis: ['Análisis', 'Indicadores y analítica'],
+  despacho: ['Prensa Central', 'Despacho — entrega y publicación'],
   informes: ['Informes', 'Generación de informes'], config: ['Configuración', 'Parámetros del sistema']
 };
 function irA(vista) {
@@ -789,8 +1162,9 @@ function irA(vista) {
   // recalcular gráficos al entrar (Chart.js necesita el contenedor visible)
   if (vista === 'analisis') renderAnalisis();
   if (vista === 'cubrimientos') renderCubrimientos();
-  if (vista === 'dashboard') { chartTipo('chTipoDash'); chartEstado('chEstadoDash'); }
+  if (vista === 'dashboard') renderDashboard();
   if (vista === 'agenda') renderAgenda();
+  if (vista === 'despacho') renderDespacho();
   window.scrollTo(0, 0);
 }
 function cerrarSidebarMovil() { $('#sidebar').classList.remove('open'); $('#backdrop').classList.remove('show'); }
@@ -801,12 +1175,19 @@ function cargarConfigUI() {
   $('#cfgSync').value = String(CFG.AUTO_SYNC_MS || 0);
   $('#cfgPCub').value = CFG.PONDERACIONES['Cubrimiento']; $('#cfgPPza').value = CFG.PONDERACIONES['Pieza gráfica']; $('#cfgPVid').value = CFG.PONDERACIONES['Grabación de video'];
   $('#cfgUMed').value = CFG.CARGA_UMBRALES.media; $('#cfgUAlta').value = CFG.CARGA_UMBRALES.alta;
+  var pe = CFG.PLAZOS_ENTREGA || {};
+  $('#cfgPlazoCub').value = pe['Cubrimiento'] != null ? pe['Cubrimiento'] : 4;
+  $('#cfgPlazoVid').value = pe['Grabación de video'] != null ? pe['Grabación de video'] : 5;
+  $('#cfgPlazoPza').value = pe['Pieza gráfica'] != null ? pe['Pieza gráfica'] : 0;
+  $('#cfgAntHabil').value = CFG.ANTELACION_MINIMA_HABIL != null ? CFG.ANTELACION_MINIMA_HABIL : 5;
 }
 function guardarConfigUI() {
   CFG.MODO = $('#cfgModo').value; CFG.API_URL = $('#cfgUrl').value.trim(); CFG.API_TOKEN = $('#cfgToken').value.trim();
   CFG.AUTO_SYNC_MS = parseInt($('#cfgSync').value, 10) || 0;
   CFG.PONDERACIONES = { 'Cubrimiento': +$('#cfgPCub').value || 0, 'Pieza gráfica': +$('#cfgPPza').value || 0, 'Grabación de video': +$('#cfgPVid').value || 0 };
   CFG.CARGA_UMBRALES = { media: +$('#cfgUMed').value || 0, alta: +$('#cfgUAlta').value || 0 };
+  CFG.PLAZOS_ENTREGA = { 'Cubrimiento': +$('#cfgPlazoCub').value || 0, 'Grabación de video': +$('#cfgPlazoVid').value || 0, 'Pieza gráfica': +$('#cfgPlazoPza').value || 0 };
+  CFG.ANTELACION_MINIMA_HABIL = +$('#cfgAntHabil').value || 0;
   saveConfig(); actualizarModeTag(); configurarAutoSync();
   toast('⚙️ Configuración guardada.', 'ok');
   sincronizar(false);
@@ -831,6 +1212,15 @@ function bindEventos() {
   $('#hamburger').addEventListener('click', function () { $('#sidebar').classList.toggle('open'); $('#backdrop').classList.toggle('show'); });
   $('#backdrop').addEventListener('click', cerrarSidebarMovil);
   $('#syncBtn').addEventListener('click', function () { sincronizar(true); });
+
+  // Filtro por fechas del dashboard (inicio)
+  function setDashRango(desde, hasta) { dashDesde = desde; dashHasta = hasta; $('#dashDesde').value = desde; $('#dashHasta').value = hasta; renderDashboard(); }
+  $('#dashDesde').addEventListener('change', function () { dashDesde = this.value; renderDashboard(); });
+  $('#dashHasta').addEventListener('change', function () { dashHasta = this.value; renderDashboard(); });
+  $('#dashRango7').addEventListener('click', function () { var h = new Date(); var a = new Date(); a.setDate(a.getDate() - 6); setDashRango(fmtISOdate(a), fmtISOdate(h)); });
+  $('#dashRango30').addEventListener('click', function () { var h = new Date(); var a = new Date(); a.setDate(a.getDate() - 29); setDashRango(fmtISOdate(a), fmtISOdate(h)); });
+  $('#dashRangoMes').addEventListener('click', function () { var n = new Date(); setDashRango(fmtISOdate(new Date(n.getFullYear(), n.getMonth(), 1)), fmtISOdate(new Date(n.getFullYear(), n.getMonth() + 1, 0))); });
+  $('#dashRangoClear').addEventListener('click', function () { setDashRango('', ''); });
   $('#overlay').addEventListener('click', cerrarDrawer); $('#drClose').addEventListener('click', cerrarDrawer);
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') cerrarDrawer(); });
 
